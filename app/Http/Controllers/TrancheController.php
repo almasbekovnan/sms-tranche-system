@@ -86,7 +86,7 @@ class TrancheController extends Controller
             $this->sheetsService->markPhonesUsed($phoneRows, $tranche);
 
             // 8. Mark templates with tranche in Google Sheets
-            $this->sheetsService->markTemplatesWithTranche($tranche, $actualCount);
+            $this->sheetsService->markTemplatesWithTranche($tranche);
 
             // 9. Increment tranche counter
             $this->incrementTranche();
