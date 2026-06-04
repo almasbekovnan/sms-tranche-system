@@ -5,11 +5,14 @@ namespace App\Services;
 use Google\Client;
 use Google\Service\Sheets;
 use Google\Service\Sheets\ValueRange;
-use Illuminate\Support\Facades\Log;
 
 class GoogleSheetsService
 {
     private Sheets $sheets;
+
+    // Column D values 1-6 = already used by previous campaigns.
+    // Values 7+ (or empty) = available for new tranches.
+    private const USED_GROUP_MAX = 6;
 
     public function __construct()
     {
@@ -23,43 +26,49 @@ class GoogleSheetsService
     }
 
     /**
-     * Get all phone numbers with their row index and tranche status.
-     * Returns: [['row' => 2, 'phone' => '77771234567', 'tranche' => ''], ...]
+     * Get all phone numbers with row index and availability.
+     * "Used" = Column D has a value of 1–6 (old campaigns) OR >= 107 (our tranches).
+     * "Available" = Column D is empty OR has value 7–106 (pre-batched, not yet sent).
      */
     public function getPhoneNumbers(): array
     {
         $spreadsheetId = config('google.phones_spreadsheet_id');
-        $sheetName = config('google.phones_sheet_name');
-        $phoneCol = config('google.phones_column');
-        $trancheCol = config('google.phones_tranche_column');
+        $sheetName     = config('google.phones_sheet_name');
+        $phoneCol      = config('google.phones_column');
+        $statusCol     = config('google.phones_tranche_column');
 
-        // Read phones column
-        $phoneRange = "{$sheetName}!{$phoneCol}:{$phoneCol}";
-        $phoneResponse = $this->sheets->spreadsheets_values->get($spreadsheetId, $phoneRange);
-        $phoneValues = $phoneResponse->getValues() ?? [];
+        $phoneResponse  = $this->sheets->spreadsheets_values->get(
+            $spreadsheetId, "{$sheetName}!{$phoneCol}:{$phoneCol}"
+        );
+        $statusResponse = $this->sheets->spreadsheets_values->get(
+            $spreadsheetId, "{$sheetName}!{$statusCol}:{$statusCol}"
+        );
 
-        // Read tranche column
-        $trancheRange = "{$sheetName}!{$trancheCol}:{$trancheCol}";
-        $trancheResponse = $this->sheets->spreadsheets_values->get($spreadsheetId, $trancheRange);
-        $trancheValues = $trancheResponse->getValues() ?? [];
+        $phoneValues  = $phoneResponse->getValues()  ?? [];
+        $statusValues = $statusResponse->getValues() ?? [];
 
         $result = [];
         foreach ($phoneValues as $index => $row) {
-            if (empty($row[0])) continue;
-
-            $phone = trim($row[0]);
+            $phone = trim($row[0] ?? '');
             if (empty($phone)) continue;
 
-            // Skip header row
+            // Skip header row (first row, non-numeric)
             if ($index === 0 && !is_numeric($phone)) continue;
 
-            $tranche = $trancheValues[$index][0] ?? '';
+            $statusRaw = trim($statusValues[$index][0] ?? '');
+            $statusNum = is_numeric($statusRaw) ? (int) $statusRaw : null;
+
+            // Used if: status 1-6 (old campaign) OR >= 107 (already sent by our system)
+            $used = ($statusNum !== null) && (
+                ($statusNum >= 1 && $statusNum <= self::USED_GROUP_MAX) ||
+                ($statusNum >= 107)
+            );
 
             $result[] = [
-                'row'     => $index + 1, // 1-based row number in sheet
-                'phone'   => $phone,
-                'tranche' => $tranche,
-                'used'    => !empty($tranche),
+                'row'    => $index + 1,
+                'phone'  => $phone,
+                'status' => $statusRaw,
+                'used'   => $used,
             ];
         }
 
@@ -67,16 +76,15 @@ class GoogleSheetsService
     }
 
     /**
-     * Get unused phone numbers (tranche column is empty).
+     * Get available (unused) phone numbers.
      */
     public function getUnusedPhones(): array
     {
-        $all = $this->getPhoneNumbers();
-        return array_values(array_filter($all, fn($p) => !$p['used']));
+        return array_values(array_filter($this->getPhoneNumbers(), fn($p) => !$p['used']));
     }
 
     /**
-     * Count unused phone numbers.
+     * Count available phone numbers.
      */
     public function countUnusedPhones(): int
     {
@@ -84,19 +92,19 @@ class GoogleSheetsService
     }
 
     /**
-     * Get message templates.
+     * Get message templates from the template spreadsheet.
      * Returns: [['row' => 2, 'text1' => '...', 'text2' => '...'], ...]
      */
     public function getTemplates(): array
     {
         $spreadsheetId = config('google.templates_spreadsheet_id');
-        $sheetName = config('google.templates_sheet_name');
-        $text1Col = config('google.templates_text1_column');
-        $text2Col = config('google.templates_text2_column');
+        $sheetName     = config('google.templates_sheet_name');
+        $text1Col      = config('google.templates_text1_column');
+        $text2Col      = config('google.templates_text2_column');
 
-        // Read whole range from A to the text2 column
-        $range = "{$sheetName}!A:{$text2Col}";
-        $response = $this->sheets->spreadsheets_values->get($spreadsheetId, $range);
+        $response = $this->sheets->spreadsheets_values->get(
+            $spreadsheetId, "{$sheetName}!A:{$text2Col}"
+        );
         $values = $response->getValues() ?? [];
 
         $colIndex1 = $this->columnLetterToIndex($text1Col);
@@ -104,8 +112,7 @@ class GoogleSheetsService
 
         $result = [];
         foreach ($values as $index => $row) {
-            // Skip header row
-            if ($index === 0) continue;
+            if ($index === 0) continue; // skip header
 
             $text1 = $row[$colIndex1] ?? '';
             $text2 = $row[$colIndex2] ?? '';
@@ -123,55 +130,48 @@ class GoogleSheetsService
     }
 
     /**
-     * Mark phone numbers as used with given tranche number.
-     * $rows: array of row numbers (1-based) from the phones sheet.
+     * Mark phone numbers as processed by writing our tranche number to Column D.
+     * $rows: 1-based row numbers in the phones sheet.
      */
     public function markPhonesUsed(array $rows, int $tranche): void
     {
         $spreadsheetId = config('google.phones_spreadsheet_id');
-        $sheetName = config('google.phones_sheet_name');
-        $trancheCol = config('google.phones_tranche_column');
+        $sheetName     = config('google.phones_sheet_name');
+        $statusCol     = config('google.phones_tranche_column');
 
         $data = [];
         foreach ($rows as $row) {
-            $range = "{$sheetName}!{$trancheCol}{$row}";
             $data[] = new ValueRange([
-                'range'  => $range,
+                'range'  => "{$sheetName}!{$statusCol}{$row}",
                 'values' => [[(string) $tranche]],
             ]);
         }
 
         if (empty($data)) return;
 
-        $body = new \Google\Service\Sheets\BatchUpdateValuesRequest([
-            'valueInputOption' => 'RAW',
-            'data'             => $data,
-        ]);
-
-        $this->sheets->spreadsheets_values->batchUpdate($spreadsheetId, $body);
+        $this->sheets->spreadsheets_values->batchUpdate(
+            $spreadsheetId,
+            new \Google\Service\Sheets\BatchUpdateValuesRequest([
+                'valueInputOption' => 'RAW',
+                'data'             => $data,
+            ])
+        );
     }
 
     /**
-     * Write tranche number to the templates spreadsheet right column.
+     * Write our tranche number to Column D of the templates sheet (header row area).
      */
-    public function markTemplatesWithTranche(int $tranche, int $count): void
+    public function markTemplatesWithTranche(int $tranche): void
     {
         $spreadsheetId = config('google.templates_spreadsheet_id');
-        $sheetName = config('google.templates_sheet_name');
-        $trancheCol = config('google.templates_tranche_column');
+        $sheetName     = config('google.templates_sheet_name');
+        $trancheCol    = config('google.templates_tranche_column');
 
-        // Write tranche to row 2 (after header) of the tranche column
         $range = "{$sheetName}!{$trancheCol}2";
-        $body = new ValueRange([
-            'range'  => $range,
-            'values' => [[(string) $tranche]],
-        ]);
+        $body  = new ValueRange(['range' => $range, 'values' => [[(string) $tranche]]]);
 
         $this->sheets->spreadsheets_values->update(
-            $spreadsheetId,
-            $range,
-            $body,
-            ['valueInputOption' => 'RAW']
+            $spreadsheetId, $range, $body, ['valueInputOption' => 'RAW']
         );
     }
 
